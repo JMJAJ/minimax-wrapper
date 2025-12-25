@@ -313,10 +313,6 @@ def select_chat_mode() -> Tuple[Optional[int], bool]:
         time.sleep(0.5)
 
 async def load_and_display_context(chat_id):
-    if not chat_id:
-        console.print(f"[dim]Starting New Session[/dim]\n")
-        return
-
     try:
         with console.status("[dim]Loading context...[/dim]"):
             details = client.get_chat_detail(chat_id)
