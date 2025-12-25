@@ -8,15 +8,11 @@ import sys
 from contextlib import asynccontextmanager
 from typing import Optional, Tuple
 from datetime import datetime
-
-#--- HTTP Client Imports ---
 from curl_cffi import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import uvicorn
-
-# --- Rich UI Imports ---
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -26,7 +22,6 @@ from rich import box
 from rich.spinner import Spinner
 from rich.live import Live
 
-# Load environment variables
 load_dotenv()
 
 MINIMAX_TOKEN = os.getenv("MINIMAX_TOKEN")
@@ -50,6 +45,7 @@ class MiniMaxClient:
         self.device_id = device_id
         self.session = requests.Session()
         
+        # Hardcoded browser fingerprinting required by their API WAF
         self.base_headers = {
             "Host": "agent.minimax.io",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:146.0) Gecko/20100101 Firefox/146.0",
@@ -69,19 +65,24 @@ class MiniMaxClient:
         return hashlib.md5(data.encode('utf-8')).hexdigest()
 
     def _get_security_headers(self, endpoint, params, payload):
+        # Reverse engineered signature generation
         ts = str(int(time.time()))
         body_str = json.dumps(payload, separators=(',', ':')) if payload else "{}"
+        
         secret_key = "I*7Cf%WZ#S&%1RlZJ&C2"
         x_signature = self._calculate_md5(f"{ts}{secret_key}{body_str}")
+        
         query_string = urllib.parse.urlencode(params)
         full_path_with_query = f"{endpoint}?{query_string}"
         encoded_path = urllib.parse.quote(full_path_with_query, safe='')
         yy = self._calculate_md5(f"{encoded_path}_{body_str}{self._calculate_md5(ts)}ooui")
+        
         return {"x-timestamp": ts, "x-signature": x_signature, "yy": yy}
 
     def post(self, endpoint, payload=None):
         if payload is None: payload = {}
         
+        # Static params required for signature validation
         params = {
             "device_platform": "web",
             "biz_id": "3",
@@ -121,7 +122,7 @@ class MiniMaxClient:
         return self.post("/matrix/api/v1/chat/list_chat", {"page_size": 20})
 
     def send_chat_message(self, text, chat_id=None, use_pro_model=False):
-        # 1 = Lightning, 0 = Pro/Agent
+        # chat_type: 0 = Pro/Agent, 1 = Lightning
         chat_type = 0 if use_pro_model else 1
         payload = {
             "msg_type": 1,
@@ -137,8 +138,6 @@ class MiniMaxClient:
 
     def get_chat_detail(self, chat_id):
         return self.post("/matrix/api/v1/chat/get_chat_detail", {"chat_id": chat_id})
-
-# --- Application Logic ---
 
 client = MiniMaxClient(MINIMAX_TOKEN, MINIMAX_USER_ID, MINIMAX_DEVICE_ID)
 
@@ -176,28 +175,41 @@ async def chat_logic_generator(message, chat_id=None, use_pro=False):
     if not current_chat_id:
         raise Exception("Failed to create chat")
 
-    seen_msg_ids = {user_msg_id}
-    # Pro mode takes longer, allow more retries
+    seen_msg_ids = set()
     max_retries = 120 if use_pro else 60 
 
     for _ in range(max_retries):
         await asyncio.sleep(2)
         details = client.get_chat_detail(current_chat_id)
+        
+        # Status: 1=Generating, 2=Done
         server_status = details.get('chat', {}).get('chat_status', 1)
+        
         messages = details.get("messages", [])
         messages.sort(key=lambda x: x['timestamp'])
         
-        has_new = False
+        # Locate user's message to filter out old history (API lag compensation)
+        user_msg_index = -1
+        for i, msg in enumerate(messages):
+            if msg.get('msg_id') == user_msg_id:
+                user_msg_index = i
+                break
         
-        for msg in messages:
+        if user_msg_index == -1:
+            continue # User message not committed to DB yet
+            
+        new_messages = messages[user_msg_index + 1:]
+        has_new_activity = False
+        
+        for msg in new_messages:
             msg_id = msg.get('msg_id')
             if msg_id in seen_msg_ids:
                 continue
                 
             seen_msg_ids.add(msg_id)
-            has_new = True
+            has_new_activity = True
             
-            # 2 = Agent Message / Tool Call
+            # msg_type 2 = Agent Response / Tool
             if msg.get('msg_type') == 2:
                 tool_call = msg.get('tool_call')
                 if tool_call:
@@ -225,11 +237,12 @@ async def chat_logic_generator(message, chat_id=None, use_pro=False):
                         'chat_id': current_chat_id
                     }
 
-        if server_status == 2 and not has_new:
+        if server_status == 2 and not has_new_activity:
             yield {'type': 'complete', 'chat_id': current_chat_id}
             break
             
-        if not use_pro and has_new:
+        # Lightning model fallback: sometimes status stays 1 but msg is complete
+        if not use_pro and has_new_activity:
             yield {'type': 'complete', 'chat_id': current_chat_id}
             break
 
@@ -257,7 +270,7 @@ def select_chat_mode() -> Tuple[Optional[int], bool]:
     for idx, chat in enumerate(chats[:10], 1):
         ts = int(chat.get('create_timestamp', 0)) / 1000
         date_str = datetime.fromtimestamp(ts).strftime('%m-%d %H:%M')
-        ctype = "[Pro]" if chat.get('chat_type') == 0 else "[Lightning]"
+        ctype = "[P]" if chat.get('chat_type') == 0 else "[L]"
         title = f"{ctype} {chat.get('chat_title', 'Untitled')}"
         table.add_row(str(idx), title, date_str)
         chat_map[str(idx)] = chat.get('chat_id')
@@ -345,7 +358,6 @@ async def run_cli_mode():
             start_time = time.time()
             last_printed_content = ""
             
-            # Using Spinner for loading animation
             with Live(Spinner("dots", text="Sending...", style="cyan"), refresh_per_second=4) as live:
                 
                 async for event in chat_logic_generator(user_input, current_chat_id, use_pro):
@@ -354,7 +366,6 @@ async def run_cli_mode():
                         live.update(Spinner("dots", text=f"Using tool: {event['name']}...", style="yellow"))
                         
                     elif event['type'] == 'thinking':
-                        # Just update status, don't print thinking block yet to keep it clean
                         live.update(Spinner("dots", text="Thinking...", style="magenta"))
                         
                     elif event['type'] == 'message':
@@ -362,7 +373,6 @@ async def run_cli_mode():
                         thinking = event.get('thinking')
 
                         if content and content != last_printed_content:
-                            # If there was thinking, print it now in a nice bubble
                             if thinking:
                                 live.console.print(Panel(
                                     Markdown(thinking), 
@@ -372,7 +382,6 @@ async def run_cli_mode():
                                     border_style="yellow"
                                 ))
                             
-                            # Print the message content
                             live.console.print(Panel(
                                 Markdown(content), 
                                 border_style="blue", 
