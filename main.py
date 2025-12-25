@@ -123,6 +123,9 @@ class MiniMaxClient:
     def list_chats(self):
         return self.post("/matrix/api/v1/chat/list_chat", {"page_size": 20})
 
+    def delete_chat(self, chat_id):
+        return self.post("/matrix/api/v1/chat/delete_chat", {"chat_id": chat_id})
+
     def send_chat_message(self, text, chat_id=None, use_pro_model=False):
         chat_type = 0 if use_pro_model else 1
         payload = {
@@ -160,12 +163,14 @@ class ChatRequest(BaseModel):
 async def chat_endpoint(req: ChatRequest):
     final_response = {}
     async for event in chat_logic_generator(req.message, req.chat_id, req.use_pro):
-        if event['type'] == 'complete':
-            final_response = event
-        elif event['type'] == 'message':
+        if event['type'] == 'message':
             final_response['response'] = event.get('content')
             final_response['thinking'] = event.get('thinking')
             final_response['chat_id'] = event.get('chat_id')
+        elif event['type'] == 'complete':
+            final_response['status'] = 'complete'
+            if 'chat_id' not in final_response:
+                final_response['chat_id'] = event.get('chat_id')
     return final_response
 
 async def chat_logic_generator(message, chat_id=None, use_pro=False):
@@ -243,37 +248,57 @@ async def chat_logic_generator(message, chat_id=None, use_pro=False):
             break
 
 def select_chat_mode() -> Tuple[Optional[int], bool]:
-    clear_screen()
-    console.print(Panel("[bold cyan]MiniMax Agent[/bold cyan]", box=box.SIMPLE))
-    
-    try:
-        with console.status("[dim]Fetching chat history...[/dim]"):
-            history = client.list_chats()
-            chats = history.get('chats', [])
-    except Exception as e:
-        console.print(f"[red]Failed to load history:[/red] {e}")
-        return None, False
-
-    table = Table(box=box.SIMPLE_HEAD, show_header=True)
-    table.add_column("ID", style="cyan", justify="right")
-    table.add_column("Title", style="white")
-    table.add_column("Date", style="dim")
-    table.add_row("0", "[bold green]Start New Chat[/bold green]", "-")
-    
-    chat_map = {}
-    for idx, chat in enumerate(chats[:10], 1):
-        ts = int(chat.get('create_timestamp', 0)) / 1000
-        date_str = datetime.fromtimestamp(ts).strftime('%m-%d %H:%M')
-        ctype = "[Pro]" if chat.get('chat_type') == 0 else "[Lightning]"
-        title = f"{ctype} {chat.get('chat_title', 'Untitled')}"
-        table.add_row(str(idx), title, date_str)
-        chat_map[str(idx)] = chat.get('chat_id')
-
-    console.print(table)
-    console.print("\n[dim]Select ID (0 for new)[/dim]")
-    
     while True:
+        clear_screen()
+        console.print(Panel("[bold cyan]MiniMax Agent[/bold cyan]", box=box.SIMPLE))
+        
+        try:
+            with console.status("[dim]Fetching chat history...[/dim]"):
+                history = client.list_chats()
+                chats = history.get('chats', [])
+        except Exception as e:
+            console.print(f"[red]Failed to load history:[/red] {e}")
+            return None, False
+
+        table = Table(box=box.SIMPLE_HEAD, show_header=True)
+        table.add_column("ID", style="cyan", justify="right")
+        table.add_column("Title", style="white")
+        table.add_column("Date", style="dim")
+        table.add_row("0", "[bold green]Start New Chat[/bold green]", "-")
+        
+        chat_map = {}
+        for idx, chat in enumerate(chats[:10], 1):
+            ts = int(chat.get('create_timestamp', 0)) / 1000
+            date_str = datetime.fromtimestamp(ts).strftime('%m-%d %H:%M')
+            ctype = "[Pro]" if chat.get('chat_type') == 0 else "[Lightning]"
+            title = f"{ctype} {chat.get('chat_title', 'Untitled')}"
+            table.add_row(str(idx), title, date_str)
+            chat_map[str(idx)] = chat.get('chat_id')
+
+        console.print(table)
+        console.print("\n[dim]Select ID, '0' for new, or 'del <ID>' to delete[/dim]")
+        
         selection = input("Select > ").strip()
+        
+        # Deletion Logic
+        if selection.lower().startswith("del"):
+            parts = selection.split()
+            if len(parts) > 1 and parts[1] in chat_map:
+                chat_id_to_del = chat_map[parts[1]]
+                try:
+                    client.delete_chat(chat_id_to_del)
+                    console.print(f"[green]Chat {parts[1]} deleted.[/green]")
+                    time.sleep(1) 
+                    continue # Reload list
+                except Exception as e:
+                    console.print(f"[red]Failed to delete:[/red] {e}")
+                    time.sleep(2)
+                    continue
+            else:
+                console.print("[red]Invalid delete command. Use 'del <ID>'[/red]")
+                time.sleep(1)
+                continue
+
         if selection == "0":
             console.print("\n[bold]Select Model:[/bold]")
             console.print("1. [cyan]Lightning[/cyan] (Fast)")
@@ -283,7 +308,9 @@ def select_chat_mode() -> Tuple[Optional[int], bool]:
 
         if selection in chat_map:
             return chat_map[selection], False 
+            
         console.print("[red]Invalid selection.[/red]")
+        time.sleep(0.5)
 
 async def load_and_display_context(chat_id):
     if not chat_id:
@@ -330,15 +357,11 @@ async def run_cli_mode():
     current_chat_id, use_pro = select_chat_mode()
     clear_screen()
     model_name = "Pro" if use_pro else "Lightning/Existing"
-
+    
     console.print(Panel(f"[bold]Session Started[/bold]\nPlan: {plan} | Credits: {credits} | Mode: {model_name}\n[dim]Enter to send | Alt+Enter for new line[/dim]\n[dim]To exit, type 'exit' or Ctrl+C[/dim]", box=box.ROUNDED))
-
+    
     await load_and_display_context(current_chat_id)
 
-    # Key Bindings Config
-    # Enter = Send (Standard)
-    # Alt+Enter = Newline
-    # Paste = Multiline safe (Handled natively by PromptSession multiline=True)
     kb = KeyBindings()
 
     @kb.add('enter')
@@ -349,11 +372,7 @@ async def run_cli_mode():
     def _(event):
         event.current_buffer.insert_text('\n')
 
-    # Configure session
-    session = PromptSession(
-        key_bindings=kb, 
-        multiline=True
-    )
+    session = PromptSession(key_bindings=kb, multiline=True)
 
     while True:
         try:
