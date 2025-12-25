@@ -4,9 +4,9 @@ function generateEnv() {
     // Attempt to grab session ID from storage
     // Fallback to searching common keys if specific keys aren't found
     const token = storage.getItem("_token") || "";
-    const deviceId = storage.getItem("USER_HARD_WARE_INFO") || storage.getItem("device_id") || "44887752";
-    const userId = storage.getItem("ANONYMOUS_REAL_USER_ID") || storage.getItem("user_id") || "";
-
+    const deviceId = storage.getItem("USER_HARD_WARE_INFO") || storage.getItem("device_id");
+    const userId = storage.getItem("ANONYMOUS_REAL_USER_ID") || storage.getItem("user_id");
+    
     if (!token) {
         console.error("Could not find '_token' in localStorage. Are you logged in?");
         return;
