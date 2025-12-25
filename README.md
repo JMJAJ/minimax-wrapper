@@ -1,6 +1,8 @@
 # MiniMax Agent API Wrapper
 
-A Python wrapper and local API server for the MiniMax Agent platform. This project reverse-engineers the request signing headers (`x-signature`, `yy`) to allow programmatic interaction with the chat interface.
+A Python wrapper and local API server for the MiniMax Agent platform. This project reverse-engineers the request signing headers (`x-signature`, `yy`) to allow programmatic interaction with the chat interface. (Works for Free Tier as well)
+
+<img width="678" height="236" alt="image" src="https://github.com/user-attachments/assets/f2a60b9e-8d8a-4cde-b552-98a2650c51f9" />
 
 ## Features
 
@@ -71,7 +73,7 @@ Send a message to the AI.
 ```json
 {
   "response": "Here is the Python script...",
-  "chat_id": 348470373945430,
+  "chat_id": 3484703739...,
   "thinking": "The user wants a CSV parser. I should use the pandas library..."
 }
 ```
@@ -87,7 +89,7 @@ curl -X POST "http://localhost:8000/chat" \
 ```bash
 curl -X POST "http://localhost:8000/chat" \
      -H "Content-Type: application/json" \
-     -d "{\"message\": \"Tell me a joke.\", \"chat_id\": 348470373945430}"
+     -d "{\"message\": \"Tell me a joke.\", \"chat_id\": 3484703739...}"
 ```
 
 ## Reverse Engineering Process
