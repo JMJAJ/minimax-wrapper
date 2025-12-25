@@ -31,7 +31,7 @@ A robust Python wrapper and local API server for the MiniMax Agent platform. Thi
 
 2. Install the required dependencies:
    ```bash
-   pip install curl_cffi fastapi uvicorn python-dotenv rich
+   pip install curl_cffi fastapi uvicorn python-dotenv prompt_toolkit rich
    ```
 
 ## Configuration

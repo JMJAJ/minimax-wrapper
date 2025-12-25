@@ -8,11 +8,13 @@ import sys
 from contextlib import asynccontextmanager
 from typing import Optional, Tuple
 from datetime import datetime
+
 from curl_cffi import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import uvicorn
+
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -21,6 +23,11 @@ from rich.table import Table
 from rich import box
 from rich.spinner import Spinner
 from rich.live import Live
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.patch_stdout import patch_stdout
 
 load_dotenv()
 
@@ -45,7 +52,6 @@ class MiniMaxClient:
         self.device_id = device_id
         self.session = requests.Session()
         
-        # Hardcoded browser fingerprinting required by their API WAF
         self.base_headers = {
             "Host": "agent.minimax.io",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:146.0) Gecko/20100101 Firefox/146.0",
@@ -65,10 +71,8 @@ class MiniMaxClient:
         return hashlib.md5(data.encode('utf-8')).hexdigest()
 
     def _get_security_headers(self, endpoint, params, payload):
-        # Reverse engineered signature generation
         ts = str(int(time.time()))
         body_str = json.dumps(payload, separators=(',', ':')) if payload else "{}"
-        
         secret_key = "I*7Cf%WZ#S&%1RlZJ&C2"
         x_signature = self._calculate_md5(f"{ts}{secret_key}{body_str}")
         
@@ -76,13 +80,11 @@ class MiniMaxClient:
         full_path_with_query = f"{endpoint}?{query_string}"
         encoded_path = urllib.parse.quote(full_path_with_query, safe='')
         yy = self._calculate_md5(f"{encoded_path}_{body_str}{self._calculate_md5(ts)}ooui")
-        
         return {"x-timestamp": ts, "x-signature": x_signature, "yy": yy}
 
     def post(self, endpoint, payload=None):
         if payload is None: payload = {}
         
-        # Static params required for signature validation
         params = {
             "device_platform": "web",
             "biz_id": "3",
@@ -122,7 +124,6 @@ class MiniMaxClient:
         return self.post("/matrix/api/v1/chat/list_chat", {"page_size": 20})
 
     def send_chat_message(self, text, chat_id=None, use_pro_model=False):
-        # chat_type: 0 = Pro/Agent, 1 = Lightning
         chat_type = 0 if use_pro_model else 1
         payload = {
             "msg_type": 1,
@@ -175,20 +176,17 @@ async def chat_logic_generator(message, chat_id=None, use_pro=False):
     if not current_chat_id:
         raise Exception("Failed to create chat")
 
-    seen_msg_ids = set()
+    seen_msg_ids = {user_msg_id}
     max_retries = 120 if use_pro else 60 
 
     for _ in range(max_retries):
         await asyncio.sleep(2)
         details = client.get_chat_detail(current_chat_id)
         
-        # Status: 1=Generating, 2=Done
         server_status = details.get('chat', {}).get('chat_status', 1)
-        
         messages = details.get("messages", [])
         messages.sort(key=lambda x: x['timestamp'])
         
-        # Locate user's message to filter out old history (API lag compensation)
         user_msg_index = -1
         for i, msg in enumerate(messages):
             if msg.get('msg_id') == user_msg_id:
@@ -196,7 +194,7 @@ async def chat_logic_generator(message, chat_id=None, use_pro=False):
                 break
         
         if user_msg_index == -1:
-            continue # User message not committed to DB yet
+            continue
             
         new_messages = messages[user_msg_index + 1:]
         has_new_activity = False
@@ -209,7 +207,6 @@ async def chat_logic_generator(message, chat_id=None, use_pro=False):
             seen_msg_ids.add(msg_id)
             has_new_activity = True
             
-            # msg_type 2 = Agent Response / Tool
             if msg.get('msg_type') == 2:
                 tool_call = msg.get('tool_call')
                 if tool_call:
@@ -241,7 +238,6 @@ async def chat_logic_generator(message, chat_id=None, use_pro=False):
             yield {'type': 'complete', 'chat_id': current_chat_id}
             break
             
-        # Lightning model fallback: sometimes status stays 1 but msg is complete
         if not use_pro and has_new_activity:
             yield {'type': 'complete', 'chat_id': current_chat_id}
             break
@@ -262,15 +258,13 @@ def select_chat_mode() -> Tuple[Optional[int], bool]:
     table.add_column("ID", style="cyan", justify="right")
     table.add_column("Title", style="white")
     table.add_column("Date", style="dim")
-
     table.add_row("0", "[bold green]Start New Chat[/bold green]", "-")
     
     chat_map = {}
-    
     for idx, chat in enumerate(chats[:10], 1):
         ts = int(chat.get('create_timestamp', 0)) / 1000
         date_str = datetime.fromtimestamp(ts).strftime('%m-%d %H:%M')
-        ctype = "[P]" if chat.get('chat_type') == 0 else "[L]"
+        ctype = "[Pro]" if chat.get('chat_type') == 0 else "[Lightning]"
         title = f"{ctype} {chat.get('chat_title', 'Untitled')}"
         table.add_row(str(idx), title, date_str)
         chat_map[str(idx)] = chat.get('chat_id')
@@ -280,19 +274,15 @@ def select_chat_mode() -> Tuple[Optional[int], bool]:
     
     while True:
         selection = input("Select > ").strip()
-        
         if selection == "0":
             console.print("\n[bold]Select Model:[/bold]")
             console.print("1. [cyan]Lightning[/cyan] (Fast)")
             console.print("2. [magenta]Pro[/magenta] (Smart/Agent)")
-            
             model_sel = input("Model > ").strip()
-            use_pro = True if model_sel == "2" else False
-            return None, use_pro
+            return None, (model_sel == "2")
 
         if selection in chat_map:
             return chat_map[selection], False 
-            
         console.print("[red]Invalid selection.[/red]")
 
 async def load_and_display_context(chat_id):
@@ -306,30 +296,28 @@ async def load_and_display_context(chat_id):
             messages = details.get("messages", [])
             messages.sort(key=lambda x: x['timestamp'])
 
-        if not messages:
-            return
+        if not messages: return
             
         console.print(Panel(f"[bold]History (Last 2 Messages)[/bold]", style="dim", box=box.MINIMAL))
-        
         for msg in messages[-2:]:
             role = "You" if msg.get('msg_type') == 1 else "MiniMax"
             content = msg.get('msg_content', '').strip()
-            
             if role == "You":
                 console.print(f"[bold green]You:[/bold green] {content}")
             else:
                 preview = content[:300] + "..." if len(content) > 300 else content
                 console.print(f"[bold cyan]MiniMax:[/bold cyan] {preview}")
             console.print("")
-        
         console.print("[dim]" + "-"*30 + "[/dim]\n")
 
     except Exception as e:
         console.print(f"[red]Failed to load context:[/red] {e}")
 
+async def get_input_async(session, text="You > "):
+    return await session.prompt_async(HTML(f"<b><style color='green'>{text}</style></b>"))
+
 async def run_cli_mode():
     clear_screen()
-    
     try:
         with console.status("[dim]Initializing...[/dim]"):
             info = client.get_membership_info()
@@ -340,78 +328,76 @@ async def run_cli_mode():
         return
 
     current_chat_id, use_pro = select_chat_mode()
-    
     clear_screen()
     model_name = "Pro" if use_pro else "Lightning/Existing"
-    console.print(Panel(f"[bold]Session Started[/bold]\nPlan: {plan} | Credits: {credits} | Mode: {model_name}\n[dim]Type 'exit' to quit[/dim]", box=box.ROUNDED))
-    
+
+    console.print(Panel(f"[bold]Session Started[/bold]\nPlan: {plan} | Credits: {credits} | Mode: {model_name}\n[dim]Enter to send | Alt+Enter for new line[/dim]\n[dim]To exit, type 'exit' or Ctrl+C[/dim]", box=box.ROUNDED))
+
     await load_and_display_context(current_chat_id)
+
+    # Key Bindings Config
+    # Enter = Send (Standard)
+    # Alt+Enter = Newline
+    # Paste = Multiline safe (Handled natively by PromptSession multiline=True)
+    kb = KeyBindings()
+
+    @kb.add('enter')
+    def _(event):
+        event.current_buffer.validate_and_handle()
+
+    @kb.add('escape', 'enter')
+    def _(event):
+        event.current_buffer.insert_text('\n')
+
+    # Configure session
+    session = PromptSession(
+        key_bindings=kb, 
+        multiline=True
+    )
 
     while True:
         try:
-            user_input = console.input("[bold green]You > [/bold green]")
-            if user_input.lower() in ['exit', 'quit']:
-                break
-            if not user_input.strip():
-                continue
+            with patch_stdout():
+                user_input = await get_input_async(session)
+
+            if not user_input.strip(): continue
+            if user_input.strip().lower() in ['exit', 'quit']: break
             
             start_time = time.time()
             last_printed_content = ""
             
-            with Live(Spinner("dots", text="Sending...", style="cyan"), refresh_per_second=4) as live:
-                
+            with Live(Spinner("dots", text="Sending...", style="cyan"), refresh_per_second=4, console=console) as live:
                 async for event in chat_logic_generator(user_input, current_chat_id, use_pro):
-                    
                     if event['type'] == 'tool':
                         live.update(Spinner("dots", text=f"Using tool: {event['name']}...", style="yellow"))
-                        
                     elif event['type'] == 'thinking':
                         live.update(Spinner("dots", text="Thinking...", style="magenta"))
-                        
                     elif event['type'] == 'message':
                         content = event['content']
                         thinking = event.get('thinking')
 
                         if content and content != last_printed_content:
                             if thinking:
-                                live.console.print(Panel(
-                                    Markdown(thinking), 
-                                    title="[bold]Thinking Process[/bold]", 
-                                    style="dim", 
-                                    box=box.ROUNDED,
-                                    border_style="yellow"
-                                ))
+                                live.console.print(Panel(Markdown(thinking), title="[bold]Thinking Process[/bold]", style="dim", box=box.ROUNDED, border_style="yellow"))
                             
-                            live.console.print(Panel(
-                                Markdown(content), 
-                                border_style="blue", 
-                                title="MiniMax",
-                                box=box.ROUNDED
-                            ))
-                            
+                            live.console.print(Panel(Markdown(content), border_style="blue", title="MiniMax", box=box.ROUNDED))
                             last_printed_content = content
                             live.update(Spinner("dots", text="Processing...", style="cyan"))
-                            
                         current_chat_id = event['chat_id']
-                    
                     elif event['type'] == 'complete':
                         current_chat_id = event['chat_id']
                         live.update(Text("Done.", style="green"))
 
             end_time = time.time()
-            duration = end_time - start_time
-            
             try:
-                latest_info = client.get_membership_info()
-                new_credits = latest_info.get('total_remains_credit', '?')
-            except:
-                new_credits = "?"
+                new_credits = client.get_membership_info().get('total_remains_credit', '?')
+            except: new_credits = "?"
                 
-            stats_text = f"Time: {duration:.2f}s  |  Credits: {new_credits}"
-            console.print(Text(stats_text, style="grey50"), justify="right")
+            console.print(Text(f"Time: {end_time - start_time:.2f}s  |  Credits: {new_credits}", style="grey50"), justify="right")
             console.print()
 
         except KeyboardInterrupt:
+            console.print("\n[yellow]Exiting chat session...[/yellow]")
             break
         except Exception as e:
             console.print(f"[red]Error:[/red] {e}")
@@ -422,13 +408,12 @@ if __name__ == "__main__":
         console.print(Panel("[bold]MiniMax Agent Wrapper[/bold]", box=box.DOUBLE))
         print("1. Interactive CLI Chat")
         print("2. API Server")
-        print("3. Exit")
-        print("")
+        print("3. Exit\n")
         
         choice = input("Enter choice: ").strip()
-        
         if choice == "1":
-            asyncio.run(run_cli_mode())
+            try: asyncio.run(run_cli_mode())
+            except KeyboardInterrupt: pass
         elif choice == "2":
             clear_screen()
             uvicorn.run(app, host="127.0.0.1", port=8000)
